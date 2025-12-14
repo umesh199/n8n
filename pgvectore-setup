@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""
+install_postgres_pgvector_rag_rhel9_FINAL_FIXED.py
+
+PostgreSQL 15 (RHEL 9) + pgvector (source build) for AI RAG
+- Red Hat AppStream PostgreSQL 15
+- pgvector built via PGXS
+- HTTP only
+- No firewalld
+- No subscription checks
+"""
+
+import os
+import subprocess
+import sys
+import time
+
+# ================= CONFIG =================
+DB_NAME = "ragdb"
+DB_USER = "raguser"
+DB_PASSWORD = "StrongPassword123"
+
+VECTOR_DIM = 768
+TABLE_NAME = "document_embeddings"
+HNSW_INDEX = "document_embeddings_hnsw_idx"
+
+PG_DATA = "/var/lib/pgsql/data"
+PG_CONFIG = "/usr/bin/pg_config"
+# =========================================
+
+def run(cmd):
+    print(f"\n[RUNNING] {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+
+def must_be_root():
+    if os.geteuid() != 0:
+        print("❌ Run this script as root")
+        sys.exit(1)
+
+# ------------------------------------------------
+def prepare_postgres_packages():
+    # Reset any previous PG streams and enable PG15 cleanly
+    run("dnf module reset postgresql -y || true")
+    run("dnf module enable postgresql:15 -y")
+
+    # Remove conflicting old libpq headers if present
+    run("dnf remove -y libpq-devel || true")
+
+    # Install required packages
+    run(
+        "dnf install -y "
+        "postgresql-server "
+        "postgresql "
+        "postgresql-contrib "
+        "postgresql-server-devel "
+        "gcc make git "
+        "python3-psycopg2"
+    )
+
+def init_postgres():
+    if not os.path.exists(f"{PG_DATA}/PG_VERSION"):
+        run("postgresql-setup --initdb")
+
+def configure_postgres():
+    # Network access (HTTP only)
+    with open(f"{PG_DATA}/postgresql.conf", "a") as f:
+        f.write("\nlisten_addresses = '*'\n")
+
+    with open(f"{PG_DATA}/pg_hba.conf", "a") as f:
+        f.write("\nhost all all 0.0.0.0/0 md5\n")
+
+def start_postgres():
+    run("systemctl enable postgresql")
+    run("systemctl restart postgresql")
+    time.sleep(3)
+
+def build_pgvector():
+    run("rm -rf /tmp/pgvector")
+    run("git clone https://github.com/pgvector/pgvector.git /tmp/pgvector")
+    run(f"cd /tmp/pgvector && make PG_CONFIG={PG_CONFIG}")
+    run(f"cd /tmp/pgvector && make install PG_CONFIG={PG_CONFIG}")
+
+def create_db_and_user():
+    run(f"sudo -i -u postgres createdb {DB_NAME} || true")
+    run(
+        f"sudo -i -u postgres psql -c "
+        f"\"CREATE USER {DB_USER} WITH PASSWORD '{DB_PASSWORD}'\" || true"
+    )
+    run(
+        f"sudo -i -u postgres psql -c "
+        f"\"GRANT ALL PRIVILEGES ON DATABASE {DB_NAME} TO {DB_USER}\""
+    )
+    run(
+        f"sudo -i -u postgres psql -d {DB_NAME} "
+        f"-c \"CREATE EXTENSION IF NOT EXISTS vector\""
+    )
+
+def create_rag_schema():
+    sql = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+    id BIGSERIAL PRIMARY KEY,
+    content TEXT,
+    metadata JSONB,
+    embedding VECTOR({VECTOR_DIM})
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes WHERE indexname = '{HNSW_INDEX}'
+    ) THEN
+        CREATE INDEX {HNSW_INDEX}
+        ON {TABLE_NAME}
+        USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 128);
+    END IF;
+END$$;
+
+ANALYZE {TABLE_NAME};
+ALTER DATABASE {DB_NAME} SET hnsw.ef_search = 64;
+"""
+    run(
+        f"sudo -i -u postgres psql -d {DB_NAME} <<'EOF'\n{sql}\nEOF"
+    )
+
+def final_checks():
+    run("pg_config --version")
+    run("sudo -i -u postgres psql -d ragdb -c \"\\dx\"")
+    run("sudo -i -u postgres psql -d ragdb -c "
+        "\"SELECT indexname FROM pg_indexes WHERE tablename='document_embeddings';\"")
+
+# ------------------------------------------------
+def main():
+    must_be_root()
+    prepare_postgres_packages()
+    init_postgres()
+    configure_postgres()
+    start_postgres()
+    build_pgvector()
+    create_db_and_user()
+    create_rag_schema()
+    final_checks()
+
+    print("\n✅ PostgreSQL 15 + pgvector RAG SETUP COMPLETE")
+    print("============================================")
+    print(f"📌 Database : {DB_NAME}")
+    print(f"📌 User     : {DB_USER}")
+    print("📌 Port     : 5432 (HTTP only)")
+    print("📌 Vector   : pgvector + HNSW")
+    print("📌 Status   : Production-ready for n8n / Ollama / RAG")
+
+if __name__ == "__main__":
+    main()

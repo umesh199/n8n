@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""
+install_n8n_native_node20_fixed.py
+
+Install n8n on RHEL 9 (NO Docker, NO RHSM)
+- Node.js 20.19.x (SUPPORTED by n8n)
+- npm global prefix fixed
+- systemd service fixed
+"""
+
+import os
+import subprocess
+import sys
+
+# ===== CONFIG =====
+NODE_VERSION = "v20.19.0"
+NODE_BASE = "/opt/nodejs"
+NODE_DIR = f"{NODE_BASE}/node-{NODE_VERSION}-linux-x64"
+NODE_TAR = f"node-{NODE_VERSION}-linux-x64.tar.xz"
+NODE_URL = f"https://nodejs.org/dist/{NODE_VERSION}/{NODE_TAR}"
+
+NPM_PREFIX = "/opt/npm-global"
+N8N_USER = "n8n"
+N8N_HOME = "/opt/n8n"
+N8N_DATA = "/opt/n8n/.n8n"
+
+# ==================
+
+def run(cmd):
+    print(f"\n[RUNNING] {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+
+def check_root():
+    if os.geteuid() != 0:
+        print("❌ Run this script as root")
+        sys.exit(1)
+
+# ------------------
+# Node.js install
+# ------------------
+def install_nodejs():
+    if os.path.exists(NODE_DIR):
+        print("✔ Node.js 20 already installed")
+        return
+
+    print("🔹 Installing Node.js 20 (binary)")
+    run(f"mkdir -p {NODE_BASE}")
+    run(f"cd {NODE_BASE} && curl -O {NODE_URL}")
+    run(f"cd {NODE_BASE} && tar -xf {NODE_TAR}")
+
+    run(f"ln -sf {NODE_DIR}/bin/node /usr/bin/node")
+    run(f"ln -sf {NODE_DIR}/bin/npm /usr/bin/npm")
+    run(f"ln -sf {NODE_DIR}/bin/npx /usr/bin/npx")
+
+# ------------------
+# npm global prefix
+# ------------------
+def configure_npm():
+    print("🔹 Configuring npm global prefix")
+    run(f"mkdir -p {NPM_PREFIX}")
+    run(f"npm config set prefix {NPM_PREFIX}")
+
+    profile = "/etc/profile.d/npm-global.sh"
+    with open(profile, "w") as f:
+        f.write(
+            f"export PATH={NPM_PREFIX}/bin:{NODE_DIR}/bin:$PATH\n"
+        )
+
+    run(f"chmod 644 {profile}")
+
+# ------------------
+# Install n8n
+# ------------------
+def install_n8n():
+    print("🔹 Installing n8n")
+    run("npm uninstall -g n8n || true")
+    run("npm install -g n8n")
+
+    if not os.path.exists(f"{NPM_PREFIX}/bin/n8n"):
+        print("❌ n8n binary not found after install")
+        sys.exit(1)
+
+# ------------------
+# User & directories
+# ------------------
+def setup_user():
+    print("🔹 Creating n8n service user")
+    run(f"id {N8N_USER} || useradd -r -m -d {N8N_HOME} -s /bin/bash {N8N_USER}")
+    run(f"mkdir -p {N8N_DATA}")
+    run(f"chown -R {N8N_USER}:{N8N_USER} {N8N_HOME}")
+    run(f"chmod 700 {N8N_HOME}")
+    run(f"chmod 700 {N8N_DATA}")
+
+# ------------------
+# Environment config
+# ------------------
+def write_env():
+    print("🔹 Writing n8n environment file")
+    env = """N8N_HOST=0.0.0.0
+N8N_PORT=5678
+N8N_PROTOCOL=http
+
+N8N_BASIC_AUTH_ACTIVE=true
+N8N_BASIC_AUTH_USER=admin
+N8N_BASIC_AUTH_PASSWORD=ChangeThisPassword
+
+NODE_ENV=production
+"""
+    path = f"{N8N_DATA}/.env"
+    with open(path, "w") as f:
+        f.write(env)
+
+    run(f"chown {N8N_USER}:{N8N_USER} {path}")
+    run(f"chmod 600 {path}")
+
+# ------------------
+# systemd service
+# ------------------
+def create_systemd():
+    print("🔹 Creating systemd service")
+    service = f"""[Unit]
+Description=n8n Workflow Automation
+After=network.target
+
+[Service]
+Type=simple
+User={N8N_USER}
+Group={N8N_USER}
+
+Environment="HOME={N8N_HOME}"
+Environment="N8N_USER_FOLDER={N8N_DATA}"
+Environment="NODE_ENV=production"
+Environment="PATH={NPM_PREFIX}/bin:{NODE_DIR}/bin:/usr/bin"
+
+ExecStart={NPM_PREFIX}/bin/n8n
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"""
+    with open("/etc/systemd/system/n8n.service", "w") as f:
+        f.write(service)
+
+    run("systemctl daemon-reexec")
+    run("systemctl daemon-reload")
+    run("systemctl enable n8n")
+    run("systemctl restart n8n")
+
+# ------------------
+def status():
+    run("systemctl status n8n --no-pager")
+
+# ------------------
+def main():
+    check_root()
+    install_nodejs()
+    configure_npm()
+    install_n8n()
+    setup_user()
+    write_env()
+    create_systemd()
+    status()
+
+    print("\n✅ n8n installation COMPLETED successfully")
+    print("🌐 Access: http://<server-ip>:5678")
+    print("🔐 Login: admin / ChangeThisPassword")
+
+# ------------------
+if __name__ == "__main__":
+    main()
